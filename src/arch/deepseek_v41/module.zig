@@ -456,13 +456,13 @@ const Dspark = struct {
 /// prompt's end (`Model.Boundary`: the rings copied, the stores' rows) and the strategy's draft caches and main row
 /// there (kept references: a decode replaces them, never writes them). The host's prefix cache decides what a later
 /// prompt reuses; `restorePrefix` honours it from here, and the prompt pass runs only what follows.
-const TurnBoundary = struct {
+pub const TurnBoundary = struct {
     ids: []u32,
     state: mdl.Model(G).Boundary,
     caches: []H.Cache = &.{},
     main_h: ?G.T = null,
 
-    fn deinit(self: *TurnBoundary, g: *G, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *TurnBoundary, g: *G, gpa: std.mem.Allocator) void {
         self.state.deinit(g, gpa);
         for (self.caches) |*c| c.deinit(g);
         gpa.free(self.caches);
@@ -559,6 +559,8 @@ pub const Module = struct {
     /// Multi-turn: the last prompt's boundary (`TurnBoundary`), kept after its request; null after a cold miss, an error
     /// or on a pinned harness.
     turn_boundary: ?TurnBoundary = null,
+    completed_boundary: ?TurnBoundary = null,
+    request_completed: bool = false,
     /// Multi-turn is installed (the served path; off when the harness pins one prompt, `bill_pinned_prompt`).
     multiturn: bool = false,
     /// Multi-turn's continuation call bill (`turnCallWave`'s inputs, from the served bill at construction): the reverse
@@ -1155,6 +1157,7 @@ pub const Module = struct {
     }
 
     pub fn deinit(self: *Module) void {
+        self.dropCompletedBoundary();
         self.recordDecodeEnd();
         const gpa = self.gpa;
         if (self.tally_path) |p| gpa.free(p);
@@ -1261,6 +1264,79 @@ pub const Module = struct {
         return self.prefillAt(0, ids, reserved_tokens);
     }
 
+    /// Capture the visible committed response while retaining the prompt fallback for serialization.
+    pub fn completeRequest(self: *Module, ids: []const u32) !void {
+        try self.gate.request();
+        if (self.gate.phase == .idle) return error.CompletionWithoutPrompt;
+        self.request_completed = false;
+        if (!self.multiturn) {
+            self.request_completed = true;
+            return;
+        }
+        const prompt = (self.turn_boundary orelse return error.CompletionHistoryMismatch).ids;
+        const plan = try completionPlan(prompt, ids, self.position());
+        self.fenceRequest() catch |e| return self.refuseBoundary(e);
+        defer self.g.reset();
+        if (plan.trim > 0) {
+            if (self.dspark) |*d| try d.lp.trimForCompletion(plan.trim) else try self.model.trim(&self.g, &self.state.?, plan.trim);
+        }
+        self.dropCompletedBoundary();
+        if (plan.keep > prompt.len) self.completed_boundary = try self.buildTurnBoundary(ids[0..plan.keep]);
+        self.request_completed = true;
+    }
+
+    pub fn clearCheckpoint(self: *Module) void {
+        self.dropCompletedBoundary();
+        self.request_completed = false;
+    }
+
+    pub fn checkpointBoundary(self: *Module, completed: bool) ?*TurnBoundary {
+        return if (completed) (if (self.completed_boundary) |*b| b else null) else (if (self.turn_boundary) |*b| b else null);
+    }
+
+    /// A disk restore replaces this serial context after compatibility checks.
+    pub fn prepareCheckpointRestore(self: *Module) !void {
+        try self.gate.request();
+        self.fenceRequest() catch |e| return self.refuseBoundary(e);
+        self.dropState();
+        self.resume_at = 0;
+        self.request_completed = false;
+    }
+
+    /// Settle outstanding target, draft and expert reads before exporting state.
+    fn fenceRequest(self: *Module) !void {
+        defer self.g.reset();
+        try self.fenceContext(if (self.state) |*st| st else null, if (self.dspark) |*d| d else null);
+        try self.synchronizeRequestRoots();
+    }
+
+    fn fenceContext(self: *Module, state: ?*M.State, dspark: ?*Dspark) !void {
+        if (dspark) |d| try d.lp.park();
+        if (state) |st| {
+            var roots: [128]G.T = undefined;
+            var n: usize = 0;
+            for (st.layers) |*layer| if (layer.frontier) |*frontier| {
+                if (n + 2 > roots.len) return error.TooManyLayers;
+                if (try frontier.kv.view(&self.g)) |x| {
+                    roots[n] = x;
+                    n += 1;
+                }
+                if (try frontier.score.view(&self.g)) |x| {
+                    roots[n] = x;
+                    n += 1;
+                }
+            };
+            try M.fence(&self.g, st, roots[0..n]);
+        }
+    }
+
+    fn synchronizeRequestRoots(self: *Module) !void {
+        try mlx.check(mlx.mlx_synchronize(self.g.s));
+        switch (self.arm) {
+            inline else => |t| try t.arm.stream.settleRoutes(),
+        }
+    }
+
     /// Multi-turn (the host's prefix cache, `sdk.Arch.restore_prefix`): the host matched `prefix` against its cache and
     /// would not run it again. The Module keeps what its one boundary honours (`boundaryKeep`: the boundary, or one
     /// position short of it; 0 otherwise) and returns it; the host runs the rest through `prefillAt`. Nothing of the state
@@ -1277,6 +1353,7 @@ pub const Module = struct {
     /// 0: a fresh request): `ids` are the positions after them. A continuation from any other position is refused by
     /// name (`PrefixNotRestored`), never run cold.
     pub fn prefillAt(self: *Module, start: u64, ids: []const u32, reserved_tokens: u64) !mlx.mlx_array {
+        self.request_completed = false;
         const kept = self.resume_at;
         self.resume_at = 0;
         if (start > 0 and start != kept) return error.PrefixNotRestored;
@@ -1311,6 +1388,7 @@ pub const Module = struct {
             // A prompt up to the sub-chunk: one call (the standard cell's path); a longer one: sub-chunk calls.
             break :blk if (ids.len <= self.prefill_sub) try self.promptCall(ids) else try self.prefillSubCalls(ids);
         };
+        self.dropCompletedBoundary();
         if (self.multiturn) try self.takeTurnBoundary(full);
         self.gate.completePrefill(self.dspark != null);
         return logits;
@@ -1381,7 +1459,11 @@ pub const Module = struct {
     /// main row kept, the ids.
     fn takeTurnBoundary(self: *Module, ids: []const u32) !void {
         self.dropTurnBoundary();
-        const st = &(self.state orelse return);
+        if (self.state != null) self.turn_boundary = try self.buildTurnBoundary(ids);
+    }
+
+    fn buildTurnBoundary(self: *Module, ids: []const u32) !TurnBoundary {
+        const st = &(self.state orelse return error.Dsv41NoRequest);
         var sb = try self.model.boundary(&self.g, self.gpa, st);
         errdefer sb.deinit(&self.g, self.gpa);
         const own = try self.gpa.dupe(u32, ids);
@@ -1392,7 +1474,7 @@ pub const Module = struct {
             for (tb.caches, d.caches) |*o, c| o.* = .{ .window = if (c.window) |w| self.g.keep(w) else null, .offset = c.offset };
             if (d.lp.main_h) |x| tb.main_h = self.g.keep(x);
         }
-        self.turn_boundary = tb;
+        return tb;
     }
 
     fn dropTurnBoundary(self: *Module) void {
@@ -1400,7 +1482,14 @@ pub const Module = struct {
         self.turn_boundary = null;
     }
 
+    fn dropCompletedBoundary(self: *Module) void {
+        if (self.completed_boundary) |*b| b.deinit(&self.g, self.gpa);
+        self.completed_boundary = null;
+    }
+
     fn dropState(self: *Module) void {
+        self.dropCompletedBoundary();
+        self.request_completed = false;
         self.dropTurnBoundary();
         self.dropDspark();
         if (self.state) |*st| st.deinit(&self.g, self.gpa);
@@ -3682,4 +3771,24 @@ test "dsv41 module: HC post capability dominates explicit settings and keeps the
     try t.expectEqual(@as(?bool, true), fallback.prefill_hc_post);
     try t.expect(!bill_mod.derivedGroupRoute(&.{ .kv16_hcpost = true }, fallback));
     try t.expect(bill_mod.derivedGroupRoute(&.{ .kv16_hcpost = true }, supported));
+}
+
+const CompletionPlan = struct { keep: usize, trim: u32 };
+
+fn completionPlan(prompt: []const u32, visible: []const u32, position: u64) !CompletionPlan {
+    if (visible.len < prompt.len or position < prompt.len or !std.mem.eql(u32, prompt, visible[0..prompt.len])) return error.CompletionHistoryMismatch;
+    const keep: usize = @intCast(@min(position, visible.len));
+    const trim = std.math.cast(u32, position - keep) orelse return error.CompletionHistoryMismatch;
+    return .{ .keep = keep, .trim = trim };
+}
+
+test "dsv41 completed cache: completion excludes unpublished and uncommitted tails and rejects another prompt" {
+    const testing = std.testing;
+    const prompt = [_]u32{ 1, 2, 3 };
+    const visible = [_]u32{ 1, 2, 3, 4, 5 };
+    try testing.expectEqual(CompletionPlan{ .keep = 4, .trim = 0 }, try completionPlan(&prompt, &visible, 4));
+    try testing.expectEqual(CompletionPlan{ .keep = 5, .trim = 1 }, try completionPlan(&prompt, &visible, 6));
+    try testing.expectError(error.CompletionHistoryMismatch, completionPlan(&prompt, &.{ 1, 9, 3, 4 }, 4));
+    try testing.expectError(error.CompletionHistoryMismatch, completionPlan(&prompt, &.{ 1, 2 }, 4));
+    try testing.expectError(error.CompletionHistoryMismatch, completionPlan(&prompt, &visible, 2));
 }
