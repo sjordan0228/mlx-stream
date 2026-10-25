@@ -3165,6 +3165,81 @@ test "dsv41 acceptance characterization: the lane's traced rounds (exact, typica
     };
 }
 
+test "dsv41 active slots: two draft loops sharing weights and experts preserve isolated committed histories when interleaved and parked" {
+    const L = Loop(TraceOps);
+    const Result = struct { tokens: [2][6]u32, offsets: [2]u32, draft_offsets: [2]u32 };
+    const Run = struct {
+        fn run(interleave: bool) !Result {
+            const a = testing.allocator;
+            var rig: Rig = undefined;
+            try rig.init();
+            defer rig.deinit();
+            var other = try rig.model.newState();
+            defer other.deinit(&rig.g, a);
+            var caches: [4]L.H.Cache = @splat(.{});
+            defer for (caches[0..rig.head.nStages()]) |*c| c.deinit(&rig.g);
+            var loops = [2]L{
+                L.init(&rig.g, rig.model, rig.head, &rig.st, rig.caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 }),
+                L.init(&rig.g, rig.model, rig.head, &other, caches[0..rig.head.nStages()], .{ .k_request = 5, .lookup = null, .max_tokens = 6 }),
+            };
+            defer for (&loops) |*lp| lp.deinit();
+            var scripts = [2]Script{
+                .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 3,
+                    .u32s = &.{ &.{ 5, 6 }, &.{ 5, 9, 7 }, &.{ 10, 11 }, &.{ 10, 12 }, &.{ 13, 14 }, &.{ 20, 21 }, &.{ 30, 31 }, &.{ 30, 31, 40 } },
+                    .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } } },
+                .{ .n_experts = @intCast(rig.m.c.n_routed_experts), .pick = 13,
+                    .u32s = &.{ &.{ 7, 8 }, &.{ 7, 11, 9 }, &.{ 12, 13 }, &.{ 12, 14 }, &.{ 15, 16 }, &.{ 22, 23 }, &.{ 32, 33 }, &.{ 32, 33, 42 } },
+                    .f32s = &.{ &.{ 0.9, 0.8 }, &.{ 0.9, 0.3 }, &.{ 0.2, 0.9 }, &.{ 0.9, 0.9 } } },
+            };
+            var outputs: [2]std.ArrayList(u32) = @splat(.empty);
+            defer for (&outputs) |*out| out.deinit(a);
+            const prompts = [_][]const u32{ &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 }, &.{ 31, 29, 27, 25, 23, 21, 19, 17, 15, 13, 11, 9, 7 } };
+            for (&loops, 0..) |*lp, i| {
+                rig.g.host_values = scripts[i].values();
+                _ = try lp.prefill(a, &rig.ex, prompts[i]);
+                if (interleave) try lp.park();
+            }
+            for (0..8) |tick| {
+                const i = if (interleave) tick % 2 else tick / 4;
+                const untouched = &loops[1 - i];
+                const before_offset = untouched.st.offset;
+                const before_draft_offset = untouched.caches[0].offset;
+                const before_window = untouched.caches[0].window;
+                const before_main = untouched.main_h;
+                const before_stats = untouched.stats;
+                rig.g.host_values = scripts[i].values();
+                _ = try loops[i].cycle(&rig.ex, &outputs[i], a, null);
+                if (interleave) {
+                    const committed = loops[i].st.offset;
+                    const emitted = outputs[i].items.len;
+                    try loops[i].park();
+                    try testing.expectEqual(committed, loops[i].st.offset);
+                    try testing.expectEqual(emitted, outputs[i].items.len);
+                }
+                try testing.expectEqual(before_offset, untouched.st.offset);
+                try testing.expectEqual(before_draft_offset, untouched.caches[0].offset);
+                try testing.expectEqual(before_window, untouched.caches[0].window);
+                try testing.expectEqual(before_main, untouched.main_h);
+                try testing.expectEqualDeep(before_stats, untouched.stats);
+            }
+            var result: Result = undefined;
+            for (&loops, 0..) |*lp, i| {
+                try testing.expectEqual(@as(usize, 6), outputs[i].items.len);
+                @memcpy(&result.tokens[i], outputs[i].items);
+                result.offsets[i] = lp.st.offset;
+                result.draft_offsets[i] = lp.caches[0].offset;
+            }
+            return result;
+        }
+    };
+    const isolated = try Run.run(false);
+    const interleaved = try Run.run(true);
+    try testing.expectEqualDeep(isolated, interleaved);
+    try testing.expectEqualSlices(u32, &.{ 5, 9, 10, 12, 20, 30 }, &interleaved.tokens[0]);
+    try testing.expectEqualSlices(u32, &.{ 7, 11, 12, 14, 22, 32 }, &interleaved.tokens[1]);
+    try testing.expectEqualSlices(u32, &.{ 28, 21 }, &interleaved.offsets);
+}
+
 test "dsv41 completed cache: unpublished committed tail trims target draft and hash together before boundary capture" {
     const a = testing.allocator;
     var rig: Rig = undefined;

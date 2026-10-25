@@ -215,8 +215,17 @@ DeepSeek-V4.1's residency settings (`model-settings.json`; a bad value is refuse
 
 | key | values | default |
 |---|---|---|
+| `active_slots` | 1 or 2 independent request contexts sharing model weights and expert banks | 1 |
+| `prefill_sub` | approximate layer-major call rows, 4,096–16,384; invalid values refuse the load | 16,384 |
+| `expert_wide_read_ahead` | prompt predictor reads; temporarily suppressed while an existing decoder borrows prompt workspace | follows `expert_wide_seed` |
 | `prompt_residents` | `keep` (a fresh prompt finds the residents decode left in the prompt rows) or `forget` (empty rows); a continuation keeps them either way; `Dsv41PromptResidentsSetting` | `keep` |
 | `resident_seed` | `usage` (the prompt rows filled at the load from the pack's `expert-usage-v1.json`) or `none`; `ResidentSeedSetting`, `ExpertUsageMissing`, `ExpertUsageMalformed`, `ExpertUsageMismatch` | `usage` when the pack has the file, else `none` |
+
+With `active_slots: 2`, a compatible host can advance two isolated requests on its single inference thread.
+It can run existing decoders between fenced prefill calls only when the mixed-phase memory bill fits;
+new prompts are not admitted at these borrowed boundaries. Admission reserves each context's retained state
+and a conservative host allowance before filling shared expert rows. `prefill_sub` changes call partitioning,
+not `ctx_size`; alignment can merge a short tail. Checkpoints distinguish numerical partition settings.
 
 The usage record (`expert_usage_record`, `expert_usage_label`) is glm5_next's; DeepSeek-V4.1 refuses either key by name
 (`ExpertUsageRecordNotInstalled`).
