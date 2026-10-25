@@ -36,6 +36,12 @@ The supported models:
 
 No weights are included in this repository.
 
+An experimental MiniMax M3.1 Flash text implementation streams prepared NVFP4 or
+affine-Q3 expert banks with bounded residency and optional Q8 KV/index caches.
+See [preparation and limitations](docs/minimax-m3.md). Source activation-quantization
+parity, representative quality and long-context validation remain pending.
+
+
 ## How mlx-serve consumes it
 
 The DeepSeek host can opt into SSD checkpoints by setting `Config.checkpoint_cache` before load admission.

@@ -3,6 +3,17 @@
 //! test block: the root adds no test of its own.
 
 comptime {
+    _ = @import("arch/minimax_m3/root.zig");
+    _ = @import("arch/minimax_m3/config.zig");
+    _ = @import("arch/minimax_m3/reference.zig");
+    _ = @import("arch/minimax_m3/sparse_decode.zig");
+    _ = @import("arch/minimax_m3/cache.zig");
+    _ = @import("arch/minimax_m3/bank.zig");
+    _ = @import("arch/minimax_m3/attention.zig");
+    _ = @import("arch/minimax_m3/experts.zig");
+    _ = @import("arch/minimax_m3/module.zig");
+    _ = @import("arch/minimax_m3/q8_cache.zig");
+
     _ = @import("arch/mimo_v2/root.zig");
     _ = @import("arch/mimo_v2/config.zig");
     _ = @import("arch/mimo_v2/settings.zig");
